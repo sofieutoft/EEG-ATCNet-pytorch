@@ -1,87 +1,61 @@
-""" 
-Copyright (C) 2022 King Saud University, Saudi Arabia 
-SPDX-License-Identifier: Apache-2.0 
+import torch
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+import scipy.io as sio
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.sampler import SubsetRandomSampler
+from sklearn.utils import shuffle
+from torchvision import transforms
 
-Licensed under the Apache License, Version 2.0 (the "License"); you may not use
-this file except in compliance with the License. You may obtain a copy of the 
-License at
-
-http://www.apache.org/licenses/LICENSE-2.0  
-
-Unless required by applicable law or agreed to in writing, software distributed
-under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR 
-CONDITIONS OF ANY KIND, either express or implied. See the License for the
-specific language governing permissions and limitations under the License. 
-
-Author:  Hamdi Altaheri 
-"""
-
-#%%
-# We need the following to load and preprocess the High Gamma Dataset
+# Load High Gamma Dataset (HGD)
 import numpy as np
 import logging
 from collections import OrderedDict
-from braindecode.datasets.bbci import BBCIDataset
-from braindecode.datautil.trial_segment import \
-    create_signal_target_from_raw_mne
+#from braindecode.datasets.bbci import BBCIDataset
+""" from braindecode.datautil.trial_segment import create_signal_target
 from braindecode.mne_ext.signalproc import mne_apply, resample_cnt
 from braindecode.datautil.signalproc import exponential_running_standardize
-from braindecode.datautil.signalproc import highpass_cnt
+from braindecode.datautil.signalproc import highpass_cnt """
+import braindecode
+import torch
+from torch.utils.data import Dataset
 
-#%%
-def load_HGD_data(data_path, subject, training, low_cut_hz =0, debug = False):
-    """ Loading training/testing data for the High Gamma Dataset (HGD)
-    for a specific subject.
-    
-    Please note that  HGD is for "executed movements" NOT "motor imagery"  
-    
-    This code is taken from https://github.com/robintibor/high-gamma-dataset 
-    You can download the HGD using the following link: 
-        https://gin.g-node.org/robintibor/high-gamma-dataset/src/master/data
-    The Braindecode library is required to load and processs the HGD dataset.
-   
-        Parameters
-        ----------
-        data_path: string
-            dataset path
-        subject: int
-            number of subject in [1, .. ,14]
-        training: bool
-            if True, load training data
-            if False, load testing data
-        debug: bool
-            if True, 
-            if False, 
-    """
+class HGDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.long)
 
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+def load_HGD_data(data_path, subject, training, low_cut_hz=0, debug=False):
     log = logging.getLogger(__name__)
     log.setLevel('DEBUG')
 
-    if training:  filename = (data_path + 'train/{}.mat'.format(subject))
-    else:         filename = (data_path + 'test/{}.mat'.format(subject))
+    if training:
+        filename = (data_path + 'train/{}.mat'.format(subject))
+    else:
+        filename = (data_path + 'test/{}.mat'.format(subject))
 
     load_sensor_names = None
     if debug:
         load_sensor_names = ['C3', 'C4', 'C2']
-    # we loaded all sensors to always get same cleaning results independent of sensor selection
-    # There is an inbuilt heuristic that tries to use only EEG channels and that definitely
-    # works for datasets in our paper
+
     loader = BBCIDataset(filename, load_sensor_names=load_sensor_names)
-    
+
     log.info("Loading data...")
     cnt = loader.load()
 
-    # Cleaning: First find all trials that have absolute microvolt values
-    # larger than +- 800 inside them and remember them for removal later
     log.info("Cutting trials...")
-
     marker_def = OrderedDict([('Right Hand', [1]), ('Left Hand', [2],),
                               ('Rest', [3]), ('Feet', [4])])
     clean_ival = [0, 4000]
 
-    set_for_cleaning = create_signal_target_from_raw_mne(cnt, marker_def,
-                                                  clean_ival)
-
+    set_for_cleaning = create_signal_target(cnt, marker_def, clean_ival)
     clean_trial_mask = np.max(np.abs(set_for_cleaning.X), axis=(1, 2)) < 800
 
     log.info("Clean trials: {:3d}  of {:3d} ({:5.1f}%)".format(
@@ -89,8 +63,6 @@ def load_HGD_data(data_path, subject, training, low_cut_hz =0, debug = False):
         len(set_for_cleaning.X),
         np.mean(clean_trial_mask) * 100))
 
-    # now pick only sensors with C in their name
-    # as they cover motor cortex
     C_sensors = ['FC5', 'FC1', 'FC2', 'FC6', 'C3', 'C4', 'CP5',
                  'CP1', 'CP2', 'CP6', 'FC3', 'FCz', 'FC4', 'C5', 'C1', 'C2',
                  'C6',
@@ -105,7 +77,6 @@ def load_HGD_data(data_path, subject, training, low_cut_hz =0, debug = False):
         C_sensors = load_sensor_names
     cnt = cnt.pick_channels(C_sensors)
 
-    # Further preprocessings as descibed in paper
     log.info("Resampling...")
     cnt = resample_cnt(cnt, 250.0)
     log.info("Highpassing...")
@@ -120,10 +91,98 @@ def load_HGD_data(data_path, subject, training, low_cut_hz =0, debug = False):
                                                   eps=1e-4).T,
         cnt)
 
-    # Trial interval, start at -500 already, since improved decoding for networks
     ival = [-500, 4000]
 
     dataset = create_signal_target_from_raw_mne(cnt, marker_def, ival)
     dataset.X = dataset.X[clean_trial_mask]
     dataset.y = dataset.y[clean_trial_mask]
-    return dataset.X, dataset.y
+
+    return HGDataset(dataset.X, dataset.y)
+
+
+# Define the dataset class
+class EEGDataset(Dataset):
+    def __init__(self, X, y, transform=None):
+        self.X = X
+        self.y = y
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        sample = {'eeg': self.X[idx], 'label': self.y[idx]}
+
+        if self.transform:
+            sample = self.transform(sample)
+
+        return sample
+
+# Custom transform to standardize the EEG data
+class StandardizeEEG(object):
+    def __init__(self, channels):
+        self.channels = channels
+        self.scalers = [StandardScaler() for _ in range(channels)]
+
+    def __call__(self, sample):
+        eeg, label = sample['eeg'], sample['label']
+
+        for j in range(self.channels):
+            eeg[:, j, :] = self.scalers[j].transform(eeg[:, j, :])
+
+        return {'eeg': eeg, 'label': label}
+
+# Get EEG data for PyTorch
+def get_data(path, subject, dataset='BCI2a', classes_labels='all', LOSO=False, isStandard=True, isShuffle=True):
+    # Load and split the dataset into training and testing
+    if LOSO:
+        # Load data using the original function
+        X_train, y_train, X_test, y_test = load_data_LOSO(path, subject, dataset)
+    else:
+        if dataset == 'BCI2a':
+            path = path + 's{:}/'.format(subject + 1)
+            X_train, y_train = load_BCI2a_data(path, subject + 1, True)
+            X_test, y_test = load_BCI2a_data(path, subject + 1, False)
+        elif dataset == 'CS2R':
+            X_train, y_train, _, _, _ = load_CS2R_data_v2(path, subject, True, classes_labels)
+            X_test, y_test, _, _, _ = load_CS2R_data_v2(path, subject, False, classes_labels)
+        elif dataset == 'HGD':
+            # Load HGD data using the provided function
+            X_train, y_train = load_HGD_data(path, subject + 1, True)
+            X_test, y_test = load_HGD_data(path, subject + 1, False)
+        else:
+            raise Exception("'{}' dataset is not supported yet!".format(dataset))
+
+    # Shuffle the data
+    if isShuffle:
+        X_train, y_train = shuffle(X_train, y_train, random_state=42)
+        X_test, y_test = shuffle(X_test, y_test, random_state=42)
+
+    # Prepare training data
+    N_tr, N_ch, T = X_train.shape
+    X_train = X_train.reshape(N_tr, 1, N_ch, T)
+    y_train_onehot = torch.from_numpy(y_train).long()
+
+    # Prepare testing data
+    N_tr, N_ch, T = X_test.shape
+    X_test = X_test.reshape(N_tr, 1, N_ch, T)
+    y_test_onehot = torch.from_numpy(y_test).long()
+
+    # Standardize the data
+    if isStandard:
+        channels = N_ch
+        transform = transforms.Compose([StandardizeEEG(channels)])
+        dataset_train = EEGDataset(X_train, y_train_onehot, transform=transform)
+        dataset_test = EEGDataset(X_test, y_test_onehot, transform=transform)
+    else:
+        dataset_train = TensorDataset(torch.Tensor(X_train), y_train_onehot)
+        dataset_test = TensorDataset(torch.Tensor(X_test), y_test_onehot)
+
+    return dataset_train, dataset_test
+
+# Example usage
+path = 'your_dataset_path/'
+subject = 1
+dataset_train, dataset_test = get_data(path, subject, dataset='BCI2a', classes_labels='all', LOSO=False, isStandard=True, isShuffle=True)
+train_loader = DataLoader(dataset_train, batch_size=32, shuffle=True)
+test_loader = DataLoader(dataset_test, batch_size=32, shuffle=False)
